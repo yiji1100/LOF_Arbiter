@@ -3,6 +3,8 @@
 > LOF 基金溢价套利机会监测与交互式咨询
 > 
 > **版本**: 2026.3.28
+> 
+> **特性**: 独立运行，不依赖 DataHub
 
 ---
 
@@ -19,10 +21,12 @@
 5. **套利收益测算** - 计算扣除费用后的理论套利收益
 6. **CSV导出** - 导出 LOF 基金行情列表
 
-### 数据来源
+### 数据来源（独立）
 
-- DataHub ETL Pipeline 产出的 `dwd_fund_lof` 融合表
-- 数据库路径：`/Users/jackyang/.openclaw/workspace/DataHub/datahub.db`
+- **自有 SQLite 数据库**：`data/lof_arbiter.db`
+- **ETL 数据源**：
+  - 新浪财经（LOF 实时行情）
+  - 东方财富（基金净值、申购状态）
 
 ---
 
@@ -46,7 +50,7 @@
 
 ### 3. 净值取值规则
 
-从 `dwd_fund_lof` 表获取净值时：
+从数据库获取净值时：
 - 优先使用 **最新净值日期** 的净值
 - 如果净值为空，使用**上一交易日**净值
 
@@ -54,32 +58,44 @@
 
 ## 数据架构
 
+### 自有数据库
+
+```
+lof_arbiter/
+└── data/
+    └── lof_arbiter.db    # SQLite 数据库
+```
+
 ### ODS 层数据来源
 
-LOF Arbiter 依赖 DataHub ETL Pipeline 的以下 ODS 层表：
+| 数据源 | 提供字段 |
+|--------|----------|
+| 新浪财经 `fund_etf_category_sina` | LOF 基金实时行情：代码、名称、现价、涨跌幅、成交额 |
+| 东方财富 `fund_open_fund_daily_em` | 基金净值：第3列（最新）、第5列（上一交易日） |
+| 东方财富 `fund_purchase_em` | 申购状态、手续费、购买起点 |
 
-| 表名 | 数据内容 | 数据源 | 更新频率 |
-|------|----------|--------|----------|
-| `ods_fund_etf_category_sina` | ETF/LOF 基金列表、实时行情（代码、名称、现价、涨跌幅、成交额） | 新浪财经 | 交易时段实时 |
-| `ods_fund_open_daily` | 开放式基金净值数据（第3/5列为单位净值） | 东方财富 | 收盘后 T+1 |
-| `ods_fund_purchase` | 基金申购状态、手续费、购买起点 | 东方财富 | 日更 |
-| `ods_fund_etf_spot_ths` | ETF 实时行情（补充净值数据） | 同花顺 | 交易时段实时 |
+### 数据库表结构
 
-### ODS 层净值字段说明
-
-`ods_fund_open_daily` 表净值字段优先级：
-1. **第3列**：`最新单位净值` 及其日期
-2. **第5列**：`上一交易日单位净值` 及其日期（当第3列为空时使用）
-
-### DWD 层融合表
-
-`dwd_fund_lof` = 多源融合：
-
-| 源表 | 提供字段 |
-|------|----------|
-| `ods_fund_etf_category_sina` | 基金代码、名称、现价、涨跌幅、成交额 |
-| `ods_fund_open_daily` | 单位净值、净值日期 |
-| `ods_fund_purchase` | 申购状态、手续费、购买起点、日累计限额 |
+```sql
+lof_daily (
+    fund_code,           -- 基金代码
+    fund_code_full,      -- 标准代码 XXXXXX.SZ/SH
+    fund_name,           -- 基金名称
+    price,               -- 现价
+    nav,                 -- 最新净值
+    nav_date,            -- 净值日期
+    prev_nav,            -- 上一交易日净值
+    prev_nav_date,       -- 上一交易日净值日期
+    premium_rate,        -- 溢价率
+    turnover,            -- 成交额
+    change_pct,          -- 涨跌幅
+    purchase_status,     -- 申购状态
+    purchase_limit,      -- 购买起点
+    daily_limit,         -- 日累计限额
+    fee_rate,            -- 手续费
+    trade_date           -- 交易日期
+)
+```
 
 ---
 
@@ -102,57 +118,21 @@ LOF Arbiter 依赖 DataHub ETL Pipeline 的以下 ODS 层表：
 用户：今天有什么 LOF 套利机会？
 ```
 
-返回：
-- 🎯 限购高溢价 TOP5（优质套利机会）
-- 🔥 高溢价 TOP5（卖出赎回套利）
-- 💎 高折价 TOP5（买入套利）
-- ⚠️ 风险提示
-
 **2. 查看特定基金**
 ```
-用户：帮我看看 168204
+用户：帮我看看 160140
 用户：煤炭LOF怎么样
 ```
-
-返回：
-- 基金基本信息（代码、名称、现价、净值）
-- **溢价率（含颜色标注）**
-- **净值日期**（重要）
-- 流动性分析（成交额）
-- 操作建议
 
 **3. 套利收益测算**
 ```
 用户：买入 10 万的煤炭 LOF，持有 7 天后卖出，能赚多少？
 ```
 
-计算：
-- 买入费用（申购费）
-- 持有期间净值变化（如有）
-- 卖出费用（赎回费 + 佣金）
-- 理论净收益
-
 **4. 导出 CSV**
 ```
 用户：导出 LOF 行情 CSV
 ```
-
-生成 CSV 文件，包含字段：
-
-| 字段 | 说明 |
-|------|------|
-| 基金代码 | 标准代码：XXXXXX.SZ / XXXXXX.SH |
-| 名称 | 基金简称 |
-| 溢价率 | (现价-净值)/净值×100% |
-| 当日交易额(万元) | 今日成交金额 |
-| 现价 | 当前交易价格 |
-| 涨跌幅 | 今日涨跌幅 |
-| 净值 | 最新单位净值 |
-| **时间** | **净值对应日期** |
-| 申购状态 | 开放申购/限大额/暂停申购 |
-| 购买起点 | 最低申购金额 |
-| 日累计限定金额 | 单日申购上限 |
-| 手续费 | 申购费率 |
 
 ---
 
@@ -175,38 +155,43 @@ LOF Arbiter 依赖 DataHub ETL Pipeline 的以下 ODS 层表：
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `db_path` | DataHub/datahub.db | 数据库路径 |
+| `db_path` | skill/data/lof_arbiter.db | 数据库路径 |
 | `min_premium_pct` | 0.5 | 溢价门槛（%） |
 | `min_turnover` | 1000000 | 最低成交额（元） |
 | `top_n` | 10 | 返回条数 |
 
 ---
 
-## 技术实现
-
-### 文件结构
+## 文件结构
 
 ```
 lof-arbiter/
-├── SKILL.md              # 本文件
+├── SKILL.md              # Skill 定义
 ├── scripts/
 │   ├── __init__.py
-│   └── query.py          # 数据查询和计算
+│   ├── db.py             # 数据库管理
+│   ├── etl.py            # 数据抓取（akshare）
+│   └── query.py          # 数据查询
+├── data/
+│   └── lof_arbiter.db   # SQLite 数据库
 └── README.md
 ```
 
 ### 核心函数
 
-| 函数 | 说明 |
-|------|------|
-| `get_lof_data()` | 获取 LOF 基金数据 |
-| `get_premium_top()` | 高溢价排行 |
-| `get_discount_top()` | 高折价排行 |
-| `get_limited_premium_top()` | 限购高溢价排行 |
-| `get_fund_by_code()` | 单基金查询 |
-| `calculate_arb_profit()` | 收益测算 |
-| `export_lof_csv()` | CSV 导出 |
-| `format_arbitrage_report()` | 生成套利报告 |
+| 模块 | 函数 | 说明 |
+|------|------|------|
+| `db.py` | `init_database()` | 初始化数据库 |
+| `db.py` | `save_lof_data()` | 保存 LOF 数据 |
+| `etl.py` | `run_etl()` | 运行 ETL（抓取并保存） |
+| `query.py` | `get_lof_data()` | 获取 LOF 基金数据 |
+| `query.py` | `get_premium_top()` | 高溢价排行 |
+| `query.py` | `get_discount_top()` | 高折价排行 |
+| `query.py` | `get_limited_premium_top()` | 限购高溢价排行 |
+| `query.py` | `get_fund_by_code()` | 单基金查询 |
+| `query.py` | `calculate_arb_profit()` | 收益测算 |
+| `query.py` | `export_lof_csv()` | CSV 导出 |
+| `query.py` | `format_arbitrage_report()` | 生成套利报告 |
 
 ---
 
@@ -245,5 +230,5 @@ lof-arbiter/
 
 | 版本 | 日期 | 说明 |
 |------|------|------|
-| **2026.3.28** | 2026-03-28 | 正式版本，支持限购溢价查询、单基金诊断、CSV导出 |
+| **2026.3.28** | 2026-03-28 | 正式版本，**独立数据库不依赖 DataHub** |
 | v0.1 | 2026-03-28 | 初始版本 |
