@@ -325,6 +325,7 @@ def format_fund_row(row: Dict, include_status: bool = True) -> str:
     premium = row.get('溢价率') or 0
     price = row.get('现价') or 0
     nav = row.get('净值') or 0
+    nav_date = row.get('净值使用日期') or row.get('交易日期') or ''
     turnover = row.get('成交额') or 0
     turnover_wan = turnover / 10000 if turnover else 0
     status = row.get('申购状态', '未知')
@@ -345,6 +346,9 @@ def format_fund_row(row: Dict, include_status: bool = True) -> str:
     else:
         turnover_str = f"{turnover_wan*10000:.0f}元"
     
+    # 净值日期
+    nav_date_str = f"（净值日期: {nav_date}）" if nav_date else ''
+    
     # 状态标签
     status_tag = ''
     if include_status:
@@ -355,7 +359,7 @@ def format_fund_row(row: Dict, include_status: bool = True) -> str:
     
     return (
         f"{name}（{code}）{status_tag}\n"
-        f"  溢价率: {premium_str} | 现价: {price:.3f} | 净值: {nav:.4f}\n"
+        f"  溢价率: {premium_str} | 现价: {price:.3f} | 净值: {nav:.4f} {nav_date_str}\n"
         f"  成交额: {turnover_str} | 状态: {status}"
     )
 
