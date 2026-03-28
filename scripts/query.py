@@ -1,11 +1,18 @@
 """
 LOF Arbiter - 数据查询模块
+
+LOF 基金溢价套利机会监测
+核心逻辑：
+1. 限购限大额 + 高溢价 = 优质套利机会
+2. 流动性（成交额）门槛筛选
+3. 净值优先取最新日期，其次取上一交易日
 """
 
 import sqlite3
 import pandas as pd
 from datetime import date, timedelta
 from typing import Optional, List, Dict
+import os
 
 # 默认数据库路径
 DEFAULT_DB_PATH = '/Users/jackyang/.openclaw/workspace/DataHub/datahub.db'
@@ -33,7 +40,13 @@ def get_lof_data(
     trade_date: Optional[str] = None,
     db_path: str = DEFAULT_DB_PATH
 ) -> pd.DataFrame:
-    """获取 LOF 基金数据"""
+    """
+    获取 LOF 基金数据
+    
+    净值取值逻辑：
+    - 优先使用 最新净值日期 的净值
+    - 如果为空，使用上一交易日净值
+    """
     if trade_date is None:
         trade_date = get_latest_trade_date(db_path)
     
@@ -45,7 +58,7 @@ def get_lof_data(
             params=(trade_date,)
         )
         
-        # 计算溢价率（处理数据类型，过滤无效数据）
+        # 计算溢价率（处理数据类型）
         if '现价' in df.columns and '净值' in df.columns:
             df['现价'] = pd.to_numeric(df['现价'], errors='coerce')
             df['净值'] = pd.to_numeric(df['净值'], errors='coerce')
@@ -54,6 +67,24 @@ def get_lof_data(
             df.loc[valid_mask, '溢价率'] = (df.loc[valid_mask, '现价'] - df.loc[valid_mask, '净值']) / df.loc[valid_mask, '净值'] * 100
             df['溢价率'] = df['溢价率'].fillna(0)
         
+        # 格式化成交额（万元）
+        if '成交额' in df.columns:
+            df['成交额_万元'] = df['成交额'] / 10000
+        
+        # 申购状态分类（用于筛选）
+        def classify_status(status):
+            if pd.isna(status):
+                return 'unknown'
+            if '暂停' in status:
+                return 'suspended'
+            if '限大额' in status or '限额' in status:
+                return 'limited'  # 限购 = 好信号
+            if '开放' in status:
+                return 'open'
+            return 'other'
+        
+        df['状态分类'] = df['申购状态'].apply(classify_status)
+        
         return df
     finally:
         conn.close()
@@ -61,40 +92,78 @@ def get_lof_data(
 
 def get_premium_top(
     n: int = 10,
-    min_turnover: float = 1000000,
     min_premium: float = 0.5,
+    min_turnover: float = 1000000,
     db_path: str = DEFAULT_DB_PATH
 ) -> pd.DataFrame:
-    """获取高溢价 TOP N（卖出赎回套利机会）"""
+    """
+    获取高溢价 TOP N（卖出赎回套利机会）
+    
+    筛选逻辑：
+    1. 溢价率 > 门槛
+    2. 成交额 >= 门槛（流动性）
+    3. 申购状态不是"暂停申购"
+    4. 优先展示：限购 > 开放申购（限购的产品溢价更稳定）
+    """
     df = get_lof_data(db_path=db_path)
     
-    # 筛选条件
+    # 基础筛选
     df = df[df['溢价率'] > min_premium]  # 溢价 > 门槛
     df = df[df['成交额'] >= min_turnover]  # 成交额 > 门槛
-    df = df[df['申购状态'].str.contains('开放', na=False)]  # 可申购（开放申购/开放式等）
+    df = df[df['状态分类'] != 'suspended']  # 排除暂停申购
     
-    # 按溢价率降序
-    df = df.sort_values('溢价率', ascending=False)
+    # 按溢价率降序，限购的排前面
+    df = df.sort_values(['溢价率', '状态分类'], ascending=[False, True])
     
     return df.head(n)
 
 
 def get_discount_top(
     n: int = 10,
-    min_turnover: float = 1000000,
     min_discount: float = 0.5,
+    min_turnover: float = 1000000,
     db_path: str = DEFAULT_DB_PATH
 ) -> pd.DataFrame:
-    """获取高折价 TOP N（买入套利机会）"""
+    """
+    获取高折价 TOP N（买入套利机会）
+    
+    筛选逻辑：
+    1. 折价率 > 门槛（折价为负数，绝对值 > 门槛）
+    2. 成交额 >= 门槛
+    3. 申购状态不是"暂停申购"
+    """
     df = get_lof_data(db_path=db_path)
     
-    # 筛选条件（折价为负数）
+    # 基础筛选（折价为负）
     df = df[df['溢价率'] < -min_discount]  # 折价 > 门槛
     df = df[df['成交额'] >= min_turnover]  # 成交额 > 门槛
-    df = df[df['申购状态'].str.contains('开放', na=False)]  # 可申购
+    df = df[df['状态分类'] != 'suspended']  # 排除暂停申购
     
     # 按折价率升序（折价越多越靠前）
     df = df.sort_values('溢价率', ascending=True)
+    
+    return df.head(n)
+
+
+def get_limited_premium_top(
+    n: int = 10,
+    min_premium: float = 0.5,
+    min_turnover: float = 1000000,
+    db_path: str = DEFAULT_DB_PATH
+) -> pd.DataFrame:
+    """
+    获取限购高溢价 TOP N（核心套利机会）
+    
+    限购产品溢价更稳定，套利空间更大
+    """
+    df = get_lof_data(db_path=db_path)
+    
+    # 筛选限购产品
+    df = df[df['状态分类'] == 'limited']  # 限大额/限额
+    df = df[df['溢价率'] > min_premium]
+    df = df[df['成交额'] >= min_turnover]
+    
+    df = df.sort_values('溢价率', ascending=False)
     
     return df.head(n)
 
@@ -134,7 +203,7 @@ def get_fund_by_code(
         
         row = df.iloc[0].to_dict()
         
-        # 计算溢价率（处理数据类型）
+        # 计算溢价率
         try:
             price = float(row.get('现价', 0)) if row.get('现价') not in [None, ''] else 0
             nav = float(row.get('净值', 0)) if row.get('净值') not in [None, ''] else 0
@@ -212,7 +281,44 @@ def calculate_arb_profit(
     }
 
 
-def format_fund_row(row: Dict) -> str:
+def export_lof_csv(
+    filepath: str,
+    min_premium: float = 0.5,
+    min_turnover: float = 1000000,
+    db_path: str = DEFAULT_DB_PATH
+) -> str:
+    """
+    导出 LOF 基金行情 CSV 文件
+    
+    字段：基金代码, 名称, 溢价率, 当日交易额(万元), 现价, 涨跌幅, 净值, 时间, 申购状态, 购买起点, 日累计限定金额, 手续费
+    """
+    df = get_lof_data(db_path=db_path)
+    
+    # 筛选有溢价率或成交额较大的
+    df = df[(df['溢价率'].abs() > 0) | (df['成交额'] >= min_turnover)]
+    
+    # 选择并重命名字段
+    export_df = pd.DataFrame()
+    export_df['基金代码'] = df['基金代码_full']
+    export_df['名称'] = df['基金名称']
+    export_df['溢价率'] = df['溢价率'].apply(lambda x: f"{x:.2f}%" if pd.notna(x) else '')
+    export_df['当日交易额(万元)'] = df['成交额_万元'].apply(lambda x: f"{x:.2f}" if pd.notna(x) else '')
+    export_df['现价'] = df['现价'].apply(lambda x: f"{x:.4f}" if pd.notna(x) else '')
+    export_df['涨跌幅'] = df['涨跌幅'].apply(lambda x: f"{x:.2f}%" if pd.notna(x) else '')
+    export_df['净值'] = df['净值'].apply(lambda x: f"{x:.4f}" if pd.notna(x) else '')
+    export_df['时间'] = df['净值使用日期'].fillna(df['交易日期'])
+    export_df['申购状态'] = df['申购状态'].fillna('')
+    export_df['购买起点'] = df['购买起点'].apply(lambda x: f"{x:.2f}" if pd.notna(x) else '')
+    export_df['日累计限定金额'] = df['日累计限定金额'].apply(lambda x: f"{x:.2f}" if pd.notna(x) else '')
+    export_df['手续费'] = df['手续费'].apply(lambda x: f"{x:.4f}" if pd.notna(x) else '')
+    
+    # 保存 CSV
+    export_df.to_csv(filepath, index=False, encoding='utf-8-sig')
+    
+    return filepath
+
+
+def format_fund_row(row: Dict, include_status: bool = True) -> str:
     """格式化基金信息为文本"""
     name = row.get('基金名称', '未知')
     code = row.get('基金代码_full', '')
@@ -220,58 +326,90 @@ def format_fund_row(row: Dict) -> str:
     price = row.get('现价') or 0
     nav = row.get('净值') or 0
     turnover = row.get('成交额') or 0
+    turnover_wan = turnover / 10000 if turnover else 0
     status = row.get('申购状态', '未知')
     
-    # 溢价率颜色
+    # 溢价率颜色和标签
     if premium is not None and premium > 1:
         premium_str = f"🔥 +{premium:.2f}%"
     elif premium is not None and premium < -1:
         premium_str = f"💎 {premium:.2f}%"
     else:
-        premium_str = f"{premium:.2f}%" if premium is not None else "N/A"
+        premium_str = f"{premium:.2f}%"
     
     # 成交额格式化
-    if turnover >= 100000000:
-        turnover_str = f"{turnover/100000000:.2f}亿"
-    elif turnover >= 10000:
-        turnover_str = f"{turnover/10000:.2f}万"
+    if turnover_wan >= 10000:
+        turnover_str = f"{turnover_wan/10000:.2f}亿"
+    elif turnover_wan >= 1:
+        turnover_str = f"{turnover_wan:.2f}万"
     else:
-        turnover_str = f"{turnover:.0f}"
+        turnover_str = f"{turnover_wan*10000:.0f}元"
+    
+    # 状态标签
+    status_tag = ''
+    if include_status:
+        if '限大额' in str(status) or '限额' in str(status):
+            status_tag = ' [限购]'
+        elif '暂停' in str(status):
+            status_tag = ' [暂停]'
     
     return (
-        f"{name}（{code}）\n"
-        f"  溢价率: {premium_str} | 现价: {price:.3f} | 净值: {nav:.3f}\n"
+        f"{name}（{code}）{status_tag}\n"
+        f"  溢价率: {premium_str} | 现价: {price:.3f} | 净值: {nav:.4f}\n"
         f"  成交额: {turnover_str} | 状态: {status}"
     )
+
+
+def format_arbitrage_report(db_path: str = DEFAULT_DB_PATH) -> str:
+    """生成套利机会报告"""
+    lines = []
+    
+    # 限购高溢价 TOP
+    df_limited = get_limited_premium_top(n=5, min_premium=0.5)
+    if not df_limited.empty:
+        lines.append("🎯 【限购高溢价 TOP5】（优质套利机会）")
+        for _, row in df_limited.iterrows():
+            lines.append(format_fund_row(row.to_dict()))
+            lines.append("")
+    else:
+        lines.append("🎯 【限购高溢价】今日暂无满足条件的限购高溢价品种")
+        lines.append("")
+    
+    # 高溢价 TOP
+    df_premium = get_premium_top(n=5, min_premium=0.5)
+    if not df_premium.empty:
+        lines.append("🔥 【高溢价 TOP5】（卖出赎回套利）")
+        for _, row in df_premium.iterrows():
+            lines.append(format_fund_row(row.to_dict()))
+            lines.append("")
+    
+    # 高折价 TOP
+    df_discount = get_discount_top(n=5, min_discount=0.5)
+    if not df_discount.empty:
+        lines.append("💎 【高折价 TOP5】（买入套利）")
+        for _, row in df_discount.iterrows():
+            lines.append(format_fund_row(row.to_dict()))
+            lines.append("")
+    
+    # 风险提示
+    lines.append("⚠️ 风险提示：")
+    lines.append("- 套利需 T+2 交割，资金占用两天")
+    lines.append("- 赎回费通常 0.5%，持有 <7天 为 1.5%")
+    lines.append("- 高溢价需关注流动性，避免无法成交")
+    lines.append("- 限购产品溢价更稳定，优先关注")
+    
+    return "\n".join(lines)
 
 
 if __name__ == '__main__':
     # 测试
     print("=== LOF Arbiter 测试 ===\n")
     
-    # 获取高溢价 TOP5
-    print("【高溢价 TOP5】")
-    df = get_premium_top(n=5)
-    for _, row in df.iterrows():
-        print(format_fund_row(row.to_dict()))
-        print()
+    # 生成报告
+    print(format_arbitrage_report())
+    print()
     
-    # 查询单只基金
-    print("\n【查询 160140】")
-    fund = get_fund_by_code('160140')
-    if fund:
-        print(format_fund_row(fund))
-    
-    # 收益测算
-    print("\n【套利收益测算】")
-    result = calculate_arb_profit('160140', 100000, hold_days=7)
-    if result:
-        print(f"基金: {result['fund_name']}")
-        print(f"买入金额: {result['buy_amount']:.2f}")
-        print(f"份额: {result['shares']:.2f}")
-        print(f"净值: {result['nav']:.4f}")
-        print(f"现价: {result['price']:.4f}")
-        print(f"申购费: {result['purchase_fee']:.2f}")
-        print(f"赎回费: {result['redeem_fee']:.2f}")
-        print(f"佣金: {result['commission']:.2f}")
-        print(f"净收益: {result['net_profit']:.2f} ({result['net_profit_rate']:.2f}%)")
+    # 导出 CSV 测试
+    export_path = '/tmp/lof_export_test.csv'
+    export_lof_csv(export_path)
+    print(f"✅ CSV 已导出: {export_path}")
